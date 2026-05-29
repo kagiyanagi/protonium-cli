@@ -1,0 +1,16 @@
+# Editor and OS noise
+*.swp
+*.swo
+*.tmp
+*.bak
+.DS_Store
+
+# Local runtime output
+*.log
+tmp/
+dist/
+
+# Local Protonium state must not live in the repo
+.vpns/
+.config/
+.local/
