@@ -235,5 +235,4 @@ protonium-cli sync
 
 MIT. See `LICENSE`.
 
----
-made with blabla.. by blablabla... ya ya yah i am the one.
+`Built with Codex. Designed and maintained by me.`
