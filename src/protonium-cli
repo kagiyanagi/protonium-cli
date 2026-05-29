@@ -1,0 +1,966 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly APP_NAME="protonium-cli"
+readonly VERSION="0.1.0"
+
+readonly CONFIG_DIR="${PROTONIUM_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/protonium-cli}"
+readonly STATE_DIR="${PROTONIUM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/protonium-cli}"
+readonly VPN_DIR="${PROTONIUM_VPN_DIR:-$HOME/.vpns}"
+readonly SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+readonly USERNAME_FILE="$CONFIG_DIR/username"
+readonly PASSWORD_FILE="$CONFIG_DIR/password"
+readonly STATE_FILE="$STATE_DIR/state"
+readonly LOCK_FILE="$STATE_DIR/lock"
+
+readonly AUTOCONNECT_UNIT="protonium-autoconnect.service"
+readonly ROTATE_UNIT="protonium-rotate.service"
+readonly ROTATE_TIMER="protonium-rotate.timer"
+readonly NMCLI_WAIT_SECONDS="${PROTONIUM_NMCLI_WAIT_SECONDS:-75}"
+
+STATE_MODE="auto"
+STATE_AUTO_COUNTRY=""
+STATE_MANUAL_KIND=""
+STATE_MANUAL_TARGET=""
+STATE_CURRENT_CONNECTION=""
+STATE_LAST_CONNECTION=""
+
+VPN_USERNAME=""
+VPN_PASSWORD=""
+CONFIG_FILES=()
+POOL_FILES=()
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+warn() {
+    printf 'warning: %s\n' "$*" >&2
+}
+
+usage() {
+    cat <<'USAGE'
+protonium-cli - lightweight Proton VPN rotation for NetworkManager
+
+Usage:
+  protonium-cli setup
+  protonium-cli status
+  protonium-cli list
+  protonium-cli sync
+  protonium-cli manual <COUNTRY_CODE|SERVER_NAME>
+  protonium-cli auto [COUNTRY_CODE]
+  protonium-cli country <COUNTRY_CODE>
+  protonium-cli stop
+  protonium-cli enable
+  protonium-cli disable
+
+Commands:
+  setup                 Save VPN credentials and update imported profiles.
+  status                Show active VPN, selected mode, and automation state.
+  list                  Show .ovpn files found in ~/.vpns.
+  sync                  Import configs and refresh saved NetworkManager secrets.
+  manual ARG            Lock to a country or server and pause rotation.
+  auto [COUNTRY_CODE]   Enable rotation globally, or within one country.
+  country COUNTRY_CODE  Alias for: auto COUNTRY_CODE.
+  stop                  Disconnect the active Protonium-managed VPN.
+  enable                Enable user systemd auto-connect and rotation.
+  disable               Disable user systemd auto-connect and rotation.
+
+Config files are read from ~/.vpns by default. Override with PROTONIUM_VPN_DIR.
+USAGE
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+ensure_dirs() {
+    install -d -m 700 "$CONFIG_DIR" "$STATE_DIR"
+}
+
+to_upper() {
+    LC_ALL=C tr '[:lower:]' '[:upper:]' <<<"$1"
+}
+
+to_lower() {
+    LC_ALL=C tr '[:upper:]' '[:lower:]' <<<"$1"
+}
+
+is_country_code() {
+    [[ "$1" =~ ^[A-Za-z]{2}$ ]]
+}
+
+normalize_country() {
+    local country="$1"
+    is_country_code "$country" || die "invalid country code: $country"
+    to_upper "$country"
+}
+
+current_user() {
+    id -un
+}
+
+is_safe_identifier() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+validate_safe_identifier() {
+    local value="$1"
+    local label="$2"
+
+    [[ -z "$value" ]] && return 0
+    is_safe_identifier "$value" || die "invalid $label in state: $value"
+}
+
+load_state() {
+    STATE_MODE="auto"
+    STATE_AUTO_COUNTRY=""
+    STATE_MANUAL_KIND=""
+    STATE_MANUAL_TARGET=""
+    STATE_CURRENT_CONNECTION=""
+    STATE_LAST_CONNECTION=""
+
+    [[ -f "$STATE_FILE" ]] || return 0
+
+    local key value
+    while IFS='=' read -r key value || [[ -n "${key:-}" ]]; do
+        [[ -z "${key:-}" || "$key" == \#* ]] && continue
+        value="${value:-}"
+        case "$key" in
+            MODE) STATE_MODE="$value" ;;
+            AUTO_COUNTRY) STATE_AUTO_COUNTRY="$value" ;;
+            MANUAL_KIND) STATE_MANUAL_KIND="$value" ;;
+            MANUAL_TARGET) STATE_MANUAL_TARGET="$value" ;;
+            CURRENT_CONNECTION) STATE_CURRENT_CONNECTION="$value" ;;
+            LAST_CONNECTION) STATE_LAST_CONNECTION="$value" ;;
+        esac
+    done <"$STATE_FILE"
+
+    case "$STATE_MODE" in
+        auto|manual) ;;
+        *) die "invalid mode in state: $STATE_MODE" ;;
+    esac
+
+    [[ -z "$STATE_AUTO_COUNTRY" ]] || STATE_AUTO_COUNTRY="$(normalize_country "$STATE_AUTO_COUNTRY")"
+    case "$STATE_MANUAL_KIND" in
+        ""|country|server) ;;
+        *) die "invalid manual target kind in state: $STATE_MANUAL_KIND" ;;
+    esac
+
+    validate_safe_identifier "$STATE_MANUAL_TARGET" "manual target"
+    validate_safe_identifier "$STATE_CURRENT_CONNECTION" "current connection"
+    validate_safe_identifier "$STATE_LAST_CONNECTION" "last connection"
+}
+
+write_state() {
+    ensure_dirs
+
+    local tmp
+    tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")" || die "could not create state file"
+    chmod 600 "$tmp"
+
+    {
+        printf 'MODE=%s\n' "$STATE_MODE"
+        printf 'AUTO_COUNTRY=%s\n' "$STATE_AUTO_COUNTRY"
+        printf 'MANUAL_KIND=%s\n' "$STATE_MANUAL_KIND"
+        printf 'MANUAL_TARGET=%s\n' "$STATE_MANUAL_TARGET"
+        printf 'CURRENT_CONNECTION=%s\n' "$STATE_CURRENT_CONNECTION"
+        printf 'LAST_CONNECTION=%s\n' "$STATE_LAST_CONNECTION"
+    } >"$tmp"
+
+    mv "$tmp" "$STATE_FILE"
+}
+
+read_secret_file() {
+    local path="$1"
+    local label="$2"
+    local value
+
+    [[ -f "$path" ]] || die "$label is not configured; run: protonium-cli setup"
+    IFS= read -r value <"$path" || die "$label is empty; run: protonium-cli setup"
+    [[ -n "$value" ]] || die "$label is empty; run: protonium-cli setup"
+    printf '%s' "$value"
+}
+
+write_secret_file() {
+    local path="$1"
+    local value="$2"
+    local tmp
+
+    tmp="$(mktemp "${path}.tmp.XXXXXX")" || die "could not write credentials"
+    chmod 600 "$tmp"
+    printf '%s\n' "$value" >"$tmp"
+    mv "$tmp" "$path"
+}
+
+read_credentials() {
+    VPN_USERNAME="$(read_secret_file "$USERNAME_FILE" "username")"
+    VPN_PASSWORD="$(read_secret_file "$PASSWORD_FILE" "password")"
+}
+
+load_config_files() {
+    CONFIG_FILES=()
+    [[ -d "$VPN_DIR" ]] || return 0
+
+    while IFS= read -r -d '' file; do
+        CONFIG_FILES+=("$file")
+    done < <(find "$VPN_DIR" -maxdepth 1 -type f -name '*.ovpn' -print0 | sort -z)
+}
+
+require_configs() {
+    load_config_files
+    ((${#CONFIG_FILES[@]} > 0)) || die "no .ovpn configs found in $VPN_DIR"
+}
+
+connection_id_for_file() {
+    local file="$1"
+    local name
+
+    name="$(basename "$file")"
+    printf '%s' "${name%.ovpn}"
+}
+
+server_name_for_connection() {
+    local connection="$1"
+    connection="${connection%.ovpn}"
+    printf '%s' "${connection%%.protonvpn.*}"
+}
+
+country_for_connection() {
+    local connection="$1"
+    local server country
+
+    server="$(server_name_for_connection "$connection")"
+    country="${server%%-*}"
+    to_upper "$country"
+}
+
+country_for_file() {
+    country_for_connection "$(connection_id_for_file "$1")"
+}
+
+config_for_connection() {
+    local connection="$1"
+    local file id
+
+    load_config_files
+    for file in "${CONFIG_FILES[@]}"; do
+        id="$(connection_id_for_file "$file")"
+        [[ "$id" == "$connection" ]] && {
+            printf '%s\n' "$file"
+            return 0
+        }
+    done
+
+    return 1
+}
+
+find_config_by_server() {
+    local target="$1"
+    local target_normalized file id server
+
+    target="${target%.ovpn}"
+    target_normalized="$(to_lower "$target")"
+    load_config_files
+
+    for file in "${CONFIG_FILES[@]}"; do
+        id="$(connection_id_for_file "$file")"
+        server="$(server_name_for_connection "$id")"
+
+        if [[ "$(to_lower "$id")" == "$target_normalized" ]] ||
+           [[ "$(to_lower "$server")" == "$target_normalized" ]]; then
+            printf '%s\n' "$file"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+select_pool() {
+    local country="${1:-}"
+    local file file_country
+
+    POOL_FILES=()
+    require_configs
+
+    for file in "${CONFIG_FILES[@]}"; do
+        file_country="$(country_for_file "$file")"
+        if [[ -z "$country" || "$file_country" == "$country" ]]; then
+            POOL_FILES+=("$file")
+        fi
+    done
+
+    if ((${#POOL_FILES[@]} == 0)); then
+        if [[ -n "$country" ]]; then
+            die "no .ovpn configs found for country $country in $VPN_DIR"
+        fi
+        die "no .ovpn configs found in $VPN_DIR"
+    fi
+}
+
+choose_config() {
+    local country="${1:-}"
+    local exclude_connection="${2:-}"
+    local file id index
+    local candidates=()
+
+    select_pool "$country"
+
+    for file in "${POOL_FILES[@]}"; do
+        id="$(connection_id_for_file "$file")"
+        if ((${#POOL_FILES[@]} > 1)) && [[ "$id" == "$exclude_connection" ]]; then
+            continue
+        fi
+        candidates+=("$file")
+    done
+
+    if ((${#candidates[@]} == 0)); then
+        candidates=("${POOL_FILES[@]}")
+    fi
+
+    index=0
+    if ((${#candidates[@]} > 1)); then
+        index=$((RANDOM % ${#candidates[@]}))
+    fi
+
+    printf '%s\n' "${candidates[$index]}"
+}
+
+connection_exists() {
+    local connection="$1"
+    nmcli -t -f connection.id connection show "$connection" >/dev/null 2>&1
+}
+
+imported_connection_name_from_output() {
+    local output="$1"
+
+    if [[ "$output" =~ Connection[[:space:]]\'([^\']+)\' ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+apply_connection_credentials() {
+    local connection="$1"
+    local owner
+
+    read_credentials
+    owner="$(current_user)"
+
+    nmcli connection modify "$connection" \
+        connection.autoconnect no \
+        connection.permissions "user:${owner}" \
+        vpn.persistent yes \
+        vpn.user-name "$VPN_USERNAME" \
+        +vpn.data "username=$VPN_USERNAME" \
+        +vpn.data "password-flags=0" \
+        +vpn.secrets "password=$VPN_PASSWORD" >/dev/null
+}
+
+import_connection() {
+    local file="$1"
+    local connection output imported
+
+    require_command nmcli
+
+    connection="$(connection_id_for_file "$file")"
+
+    if ! connection_exists "$connection"; then
+        output="$(nmcli connection import type openvpn file "$file" 2>&1)" || {
+            printf '%s\n' "$output" >&2
+            die "failed to import $file"
+        }
+
+        if ! connection_exists "$connection"; then
+            imported="$(imported_connection_name_from_output "$output")"
+            if [[ -n "$imported" ]] && connection_exists "$imported"; then
+                nmcli connection modify "$imported" connection.id "$connection" >/dev/null
+            fi
+        fi
+    fi
+
+    connection_exists "$connection" || die "NetworkManager did not create expected connection: $connection"
+    apply_connection_credentials "$connection"
+}
+
+is_managed_connection() {
+    local connection="$1"
+    local file id
+
+    load_config_files
+    for file in "${CONFIG_FILES[@]}"; do
+        id="$(connection_id_for_file "$file")"
+        [[ "$id" == "$connection" ]] && return 0
+    done
+
+    return 1
+}
+
+active_vpn_connections() {
+    nmcli -t -f NAME,TYPE connection show --active 2>/dev/null |
+        while IFS=':' read -r name type _rest; do
+            [[ "$type" == "vpn" ]] || continue
+            printf '%s\n' "${name//\\:/:}"
+        done
+}
+
+down_managed_vpns() {
+    local keep_connection="${1:-}"
+    local active
+
+    while IFS= read -r active; do
+        [[ -z "$active" ]] && continue
+        [[ "$active" == "$keep_connection" ]] && continue
+        is_managed_connection "$active" || continue
+        nmcli connection down "$active" >/dev/null 2>&1 || true
+    done < <(active_vpn_connections)
+}
+
+connect_file() {
+    local file="$1"
+    local connection server country
+
+    require_command nmcli
+    read_credentials
+
+    connection="$(connection_id_for_file "$file")"
+    server="$(server_name_for_connection "$connection")"
+    country="$(country_for_connection "$connection")"
+
+    import_connection "$file"
+    down_managed_vpns "$connection"
+
+    nmcli --wait "$NMCLI_WAIT_SECONDS" connection up "$connection" >/dev/null || {
+        die "failed to connect $connection without prompting; run protonium-cli setup, then protonium-cli sync"
+    }
+
+    STATE_CURRENT_CONNECTION="$connection"
+    STATE_LAST_CONNECTION="$connection"
+    write_state
+
+    printf 'Connected: %s (%s)\n' "$server" "$country"
+}
+
+systemctl_user() {
+    require_command systemctl
+    systemctl --user "$@"
+}
+
+systemd_user_available() {
+    command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
+write_systemd_units() {
+    local cli_path="$1"
+
+    install -d -m 755 "$SYSTEMD_USER_DIR"
+
+    cat >"$SYSTEMD_USER_DIR/$AUTOCONNECT_UNIT" <<UNIT
+[Unit]
+Description=Protonium VPN auto-connect
+Documentation=man:nmcli(1)
+After=default.target
+StartLimitIntervalSec=5min
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+ExecStart=$cli_path connect-current
+TimeoutStartSec=120
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=default.target
+UNIT
+
+    cat >"$SYSTEMD_USER_DIR/$ROTATE_UNIT" <<UNIT
+[Unit]
+Description=Protonium VPN rotation
+Documentation=man:nmcli(1)
+
+[Service]
+Type=oneshot
+ExecStart=$cli_path rotate
+TimeoutStartSec=120
+UNIT
+
+    cat >"$SYSTEMD_USER_DIR/$ROTATE_TIMER" <<UNIT
+[Unit]
+Description=Rotate Protonium VPN every 30 minutes
+
+[Timer]
+OnStartupSec=30min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=$ROTATE_UNIT
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+installed_cli_path() {
+    local installed="$HOME/.local/bin/protonium-cli"
+
+    if [[ -x "$installed" ]]; then
+        printf '%s' "$installed"
+        return 0
+    fi
+
+    if command -v protonium-cli >/dev/null 2>&1; then
+        command -v protonium-cli
+        return 0
+    fi
+
+    readlink -f "$0"
+}
+
+cmd_systemd_install() {
+    local cli_path
+
+    cli_path="$(installed_cli_path)"
+    write_systemd_units "$cli_path"
+
+    if systemd_user_available; then
+        systemctl_user daemon-reload
+    else
+        warn "systemd user manager is not available; units were written but not loaded"
+    fi
+
+    printf 'Installed user systemd units in %s\n' "$SYSTEMD_USER_DIR"
+}
+
+enable_linger_best_effort() {
+    local owner
+
+    command -v loginctl >/dev/null 2>&1 || return 0
+    owner="$(current_user)"
+
+    if ! loginctl enable-linger "$owner" >/dev/null 2>&1; then
+        warn "could not enable linger; boot auto-connect may start only after login"
+    fi
+}
+
+enable_rotation_timer_best_effort() {
+    if ! systemd_user_available; then
+        warn "systemd user manager is not available; rotation timer was not enabled"
+        return 0
+    fi
+
+    cmd_systemd_install >/dev/null
+    systemctl_user enable --now "$ROTATE_TIMER" >/dev/null ||
+        warn "could not enable $ROTATE_TIMER"
+}
+
+pause_rotation_best_effort() {
+    systemd_user_available || return 0
+    systemctl_user disable --now "$ROTATE_TIMER" >/dev/null 2>&1 || true
+}
+
+cmd_enable() {
+    require_configs
+    read_credentials
+    cmd_systemd_install >/dev/null
+    enable_linger_best_effort
+
+    systemd_user_available || die "systemd user manager is not available"
+
+    systemctl_user enable --now "$AUTOCONNECT_UNIT" >/dev/null
+
+    load_state
+    if [[ "$STATE_MODE" == "auto" ]]; then
+        systemctl_user enable --now "$ROTATE_TIMER" >/dev/null
+    else
+        systemctl_user disable --now "$ROTATE_TIMER" >/dev/null 2>&1 || true
+    fi
+
+    printf 'Enabled Protonium user services.\n'
+}
+
+cmd_disable() {
+    if systemd_user_available; then
+        systemctl_user disable --now "$ROTATE_TIMER" "$AUTOCONNECT_UNIT" >/dev/null 2>&1 || true
+        systemctl_user stop "$ROTATE_UNIT" >/dev/null 2>&1 || true
+        printf 'Disabled Protonium user services.\n'
+    else
+        warn "systemd user manager is not available"
+    fi
+}
+
+cmd_setup() {
+    local username password confirm
+
+    ensure_dirs
+    umask 077
+
+    printf 'VPN username: '
+    IFS= read -r username
+    [[ -n "$username" ]] || die "username cannot be empty"
+
+    printf 'VPN password: '
+    IFS= read -rs password
+    printf '\n'
+    [[ -n "$password" ]] || die "password cannot be empty"
+
+    printf 'Confirm VPN password: '
+    IFS= read -rs confirm
+    printf '\n'
+    [[ "$password" == "$confirm" ]] || die "passwords do not match"
+
+    write_secret_file "$USERNAME_FILE" "$username"
+    write_secret_file "$PASSWORD_FILE" "$password"
+
+    printf 'Credentials saved in %s\n' "$CONFIG_DIR"
+
+    load_config_files
+    if ((${#CONFIG_FILES[@]} > 0)); then
+        printf 'Updating NetworkManager profiles...\n'
+        cmd_sync
+    else
+        warn "no .ovpn configs found in $VPN_DIR"
+    fi
+}
+
+sync_connections() {
+    local quiet="${1:-0}"
+    local file connection count=0
+
+    require_command nmcli
+    read_credentials
+    require_configs
+
+    for file in "${CONFIG_FILES[@]}"; do
+        connection="$(connection_id_for_file "$file")"
+        import_connection "$file"
+        if [[ "$quiet" != "1" ]]; then
+            printf 'Synced: %s\n' "$connection"
+        fi
+        count=$((count + 1))
+    done
+
+    if [[ "$quiet" != "1" ]]; then
+        printf 'Synced %d NetworkManager profile(s).\n' "$count"
+    fi
+}
+
+cmd_sync() {
+    sync_connections 0
+}
+
+cmd_list() {
+    local file connection server country imported active active_map
+
+    require_configs
+    require_command nmcli
+
+    active_map="$(active_vpn_connections || true)"
+
+    printf '%-6s  %-24s  %-34s  %-8s  %s\n' "CC" "SERVER" "CONNECTION" "IMPORTED" "ACTIVE"
+    printf '%-6s  %-24s  %-34s  %-8s  %s\n' "------" "------------------------" "----------------------------------" "--------" "------"
+
+    for file in "${CONFIG_FILES[@]}"; do
+        connection="$(connection_id_for_file "$file")"
+        server="$(server_name_for_connection "$connection")"
+        country="$(country_for_connection "$connection")"
+
+        imported="no"
+        connection_exists "$connection" && imported="yes"
+
+        active="no"
+        if grep -Fxq "$connection" <<<"$active_map"; then
+            active="yes"
+        fi
+
+        printf '%-6s  %-24s  %-34s  %-8s  %s\n' "$country" "$server" "$connection" "$imported" "$active"
+    done
+}
+
+cmd_status() {
+    local mode pool current server country rotation boot
+
+    require_command nmcli
+    load_state
+
+    mode="Auto"
+    pool="global"
+    if [[ "$STATE_MODE" == "manual" ]]; then
+        mode="Manual"
+        pool="${STATE_MANUAL_TARGET:-unknown}"
+    elif [[ -n "$STATE_AUTO_COUNTRY" ]]; then
+        pool="$STATE_AUTO_COUNTRY"
+    fi
+
+    current=""
+    while IFS= read -r active; do
+        is_managed_connection "$active" || continue
+        current="$active"
+        break
+    done < <(active_vpn_connections)
+
+    if [[ -n "$current" ]]; then
+        server="$(server_name_for_connection "$current")"
+        country="$(country_for_connection "$current")"
+    else
+        server="disconnected"
+        country="-"
+    fi
+
+    rotation="unavailable"
+    boot="unavailable"
+    if systemd_user_available; then
+        rotation="$(systemctl --user is-enabled "$ROTATE_TIMER" 2>/dev/null || true)"
+        boot="$(systemctl --user is-enabled "$AUTOCONNECT_UNIT" 2>/dev/null || true)"
+        [[ -n "$rotation" ]] || rotation="disabled"
+        [[ -n "$boot" ]] || boot="disabled"
+    fi
+
+    printf 'Status: %s\n' "$server"
+    printf 'Country: %s\n' "$country"
+    printf 'Mode: %s\n' "$mode"
+    printf 'Pool: %s\n' "$pool"
+    printf 'Rotation timer: %s\n' "$rotation"
+    printf 'Boot auto-connect: %s\n' "$boot"
+}
+
+cmd_manual() {
+    local target="$1"
+    local country file connection server
+
+    [[ -n "$target" ]] || die "manual requires a country code or server name"
+
+    load_state
+
+    if is_country_code "$target"; then
+        country="$(normalize_country "$target")"
+        file="$(choose_config "$country" "$STATE_CURRENT_CONNECTION")"
+        connection="$(connection_id_for_file "$file")"
+        server="$(server_name_for_connection "$connection")"
+        STATE_MANUAL_KIND="country"
+        STATE_MANUAL_TARGET="$country"
+    else
+        file="$(find_config_by_server "$target")" || die "server not found in $VPN_DIR: $target"
+        connection="$(connection_id_for_file "$file")"
+        server="$(server_name_for_connection "$connection")"
+        STATE_MANUAL_KIND="server"
+        STATE_MANUAL_TARGET="$server"
+    fi
+
+    STATE_MODE="manual"
+    STATE_AUTO_COUNTRY=""
+    STATE_CURRENT_CONNECTION="$connection"
+    STATE_LAST_CONNECTION="$connection"
+    write_state
+
+    pause_rotation_best_effort
+    connect_file "$file"
+
+    printf 'Manual lock enabled. Rotation is paused.\n'
+}
+
+cmd_auto() {
+    local country="${1:-}"
+    local file
+
+    if [[ -n "$country" ]]; then
+        country="$(normalize_country "$country")"
+    fi
+
+    load_state
+
+    STATE_MODE="auto"
+    STATE_AUTO_COUNTRY="$country"
+    STATE_MANUAL_KIND=""
+    STATE_MANUAL_TARGET=""
+    write_state
+
+    file="$(choose_config "$country" "$STATE_CURRENT_CONNECTION")"
+    connect_file "$file"
+    enable_rotation_timer_best_effort
+
+    if [[ -n "$country" ]]; then
+        printf 'Auto-rotation enabled for %s.\n' "$country"
+    else
+        printf 'Auto-rotation enabled globally.\n'
+    fi
+}
+
+cmd_rotate() {
+    local file
+
+    load_state
+    [[ "$STATE_MODE" == "auto" ]] || {
+        printf 'Manual mode is active; rotation skipped.\n'
+        return 0
+    }
+
+    file="$(choose_config "$STATE_AUTO_COUNTRY" "$STATE_CURRENT_CONNECTION")"
+    connect_file "$file"
+}
+
+cmd_connect_current() {
+    local file
+
+    load_state
+
+    if [[ "$STATE_MODE" == "manual" ]]; then
+        if [[ -n "$STATE_CURRENT_CONNECTION" ]] && file="$(config_for_connection "$STATE_CURRENT_CONNECTION")"; then
+            connect_file "$file"
+            return 0
+        fi
+
+        case "$STATE_MANUAL_KIND" in
+            server)
+                file="$(find_config_by_server "$STATE_MANUAL_TARGET")" ||
+                    die "manual server is no longer available: $STATE_MANUAL_TARGET"
+                ;;
+            country)
+                file="$(choose_config "$STATE_MANUAL_TARGET" "$STATE_CURRENT_CONNECTION")"
+                ;;
+            *)
+                die "manual mode has no valid target; run protonium-cli manual <target>"
+                ;;
+        esac
+    else
+        file="$(choose_config "$STATE_AUTO_COUNTRY" "$STATE_CURRENT_CONNECTION")"
+    fi
+
+    connect_file "$file"
+}
+
+cmd_stop() {
+    local stopped=0 active
+
+    require_command nmcli
+
+    while IFS= read -r active; do
+        [[ -z "$active" ]] && continue
+        is_managed_connection "$active" || continue
+        nmcli connection down "$active" >/dev/null 2>&1 || true
+        printf 'Disconnected: %s\n' "$active"
+        stopped=$((stopped + 1))
+    done < <(active_vpn_connections)
+
+    if ((stopped == 0)); then
+        printf 'No active Protonium-managed VPN connection found.\n'
+    fi
+}
+
+cmd_uninstall_connections() {
+    local file connection removed=0
+
+    require_command nmcli
+    load_config_files
+
+    for file in "${CONFIG_FILES[@]}"; do
+        connection="$(connection_id_for_file "$file")"
+        if connection_exists "$connection"; then
+            nmcli connection delete "$connection" >/dev/null || true
+            printf 'Removed NetworkManager profile: %s\n' "$connection"
+            removed=$((removed + 1))
+        fi
+    done
+
+    load_state
+    for connection in "$STATE_CURRENT_CONNECTION" "$STATE_LAST_CONNECTION"; do
+        [[ -n "$connection" ]] || continue
+        if connection_exists "$connection"; then
+            nmcli connection delete "$connection" >/dev/null || true
+            printf 'Removed NetworkManager profile: %s\n' "$connection"
+            removed=$((removed + 1))
+        fi
+    done
+
+    printf 'Removed %d NetworkManager profile(s).\n' "$removed"
+}
+
+run_with_lock() {
+    local command="$1"
+    shift || true
+
+    ensure_dirs
+    exec 9>"$LOCK_FILE"
+    flock 9 || die "could not lock $LOCK_FILE"
+
+    "$command" "$@"
+}
+
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    case "$command" in
+        help|-h|--help)
+            usage
+            ;;
+        version|--version)
+            printf '%s %s\n' "$APP_NAME" "$VERSION"
+            ;;
+        setup)
+            require_command flock
+            run_with_lock cmd_setup "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        list)
+            cmd_list "$@"
+            ;;
+        sync)
+            require_command flock
+            run_with_lock cmd_sync "$@"
+            ;;
+        manual)
+            require_command flock
+            (($# == 1)) || die "usage: protonium-cli manual <COUNTRY_CODE|SERVER_NAME>"
+            run_with_lock cmd_manual "$1"
+            ;;
+        auto)
+            require_command flock
+            (($# <= 1)) || die "usage: protonium-cli auto [COUNTRY_CODE]"
+            run_with_lock cmd_auto "${1:-}"
+            ;;
+        country)
+            require_command flock
+            (($# == 1)) || die "usage: protonium-cli country <COUNTRY_CODE>"
+            run_with_lock cmd_auto "$1"
+            ;;
+        rotate)
+            require_command flock
+            run_with_lock cmd_rotate "$@"
+            ;;
+        connect-current)
+            require_command flock
+            run_with_lock cmd_connect_current "$@"
+            ;;
+        stop)
+            require_command flock
+            run_with_lock cmd_stop "$@"
+            ;;
+        enable)
+            require_command flock
+            run_with_lock cmd_enable "$@"
+            ;;
+        disable)
+            require_command flock
+            run_with_lock cmd_disable "$@"
+            ;;
+        systemd-install)
+            cmd_systemd_install "$@"
+            ;;
+        uninstall-connections)
+            require_command flock
+            run_with_lock cmd_uninstall_connections "$@"
+            ;;
+        *)
+            usage >&2
+            die "unknown command: $command"
+            ;;
+    esac
+}
+
+main "$@"
